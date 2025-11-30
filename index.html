@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LEF Cell 視覺化儀表板 (離線版 - 多選支援)</title>
+    
+    <!-- [修改] 改為讀取本地 lib 資料夾 -->
+    <script src="lib/react.production.min.js"></script>
+    <script src="lib/react-dom.production.min.js"></script>
+    <script src="lib/babel.min.js"></script>
+    <script src="lib/tailwindcss.js"></script>
+    <script src="lib/lucide.min.js"></script>
+
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        slate: {
+                            850: '#151f32', 
+                            900: '#0f172a',
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        .dark ::-webkit-scrollbar-thumb { background: #475569; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        
+        .canvas-container {
+            background-color: #0f172a; /* Slate 900 */
+            cursor: grab;
+        }
+        .canvas-container:active {
+            cursor: grabbing;
+        }
+        .light .canvas-container {
+            background-color: #f8fafc;
+        }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-900 dark:bg-slate-900 dark:text-gray-100 transition-colors duration-300">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useMemo, useRef, useCallback } = React;
+
+        // --- CONSTANTS ---
+        const LAYER_COLORS = {
+            'METAL0': '#4169E1', 'M0': '#4169E1',
+            'METAL1': '#DC143C', 'M1': '#DC143C',
+            'METAL2': '#32CD32', 'M2': '#32CD32',
+            'METAL3': '#FFD700', 'M3': '#FFD700',
+            'METAL4': '#8A2BE2', 'M4': '#8A2BE2',
+            'METAL5': '#CD853F', 'M5': '#CD853F',
+            'METAL6': '#FF00FF', 'M6': '#FF00FF',
+            'METAL7': '#00CED1', 'M7': '#00CED1',
+            'METAL8': '#8B4513', 'M8': '#8B4513',
+            'METAL9': '#FFFF00', 'M9': '#FFFF00',
+            'METAL10': '#9ACD32', 'M10': '#9ACD32',
+            'METAL11': '#FF1493', 'M11': '#FF1493',
+            'METAL12': '#DEB887', 'M12': '#DEB887',
+            'METAL13': '#008B8B', 'M13': '#008B8B',
+            'METAL14': '#9370DB', 'M14': '#9370DB',
+            'METAL15': '#556B2F', 'M15': '#556B2F',
+            'VIA0': '#FF4500', 'V0': '#FF4500',
+            'VIA1': '#32CD32', 'V1': '#32CD32',
+            'VIA2': '#ADFF2F', 'V2': '#ADFF2F',
+            'VIA3': '#D2691E', 'V3': '#D2691E',
+            'VIA4': '#F4A460', 'V4': '#F4A460',
+            'VIA5': '#DA70D6', 'V5': '#DA70D6',
+            'VIA6': '#40E0D0', 'V6': '#40E0D0',
+            'VIA7': '#A0522D', 'V7': '#A0522D',
+            'VIA8': '#F0E68C', 'V8': '#F0E68C',
+            'VIA9': '#00FF00', 'V9': '#00FF00',
+            'VIA10': '#FF69B4', 'V10': '#FF69B4',
+            'VIA11': '#CD853F', 'V11': '#CD853F',
+            'VIA12': '#00FFFF', 'V12': '#00FFFF',
+            'VIA13': '#708090', 'V13': '#708090',
+            'VIA14': '#FF0000', 'V14': '#FF0000',
+            'VIA': '#FFFF00', 'OBS': '#808080'
+        };
+
+        const PIN_COLORS = {
+            'INPUT': "#72f8a3",
+            'OUTPUT': "#ffd249",
+            'INOUT': "#9fb2b6",
+            'UNKNOWN': '#9ca3af'
+        };
+
+        // --- COMPONENTS ---
+
+        const Icon = ({ name, size = 18, className }) => {
+            const ref = useRef(null);
+            useEffect(() => {
+                if (window.lucide && window.lucide.icons && window.lucide.icons[name] && ref.current) {
+                    const svgString = window.lucide.icons[name].toSvg({ 
+                        'class': className, 
+                        'width': size, 
+                        'height': size,
+                        'stroke-width': 2
+                    });
+                    ref.current.innerHTML = svgString;
+                }
+            }, [name, size, className]);
+            return <span ref={ref} style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}></span>;
+        };
+
+        const App = () => {
+            const [darkMode, setDarkMode] = useState(true);
+            const [macros, setMacros] = useState([]);
+            const [dbMicrons, setDbMicrons] = useState(1000);
+            // [修改] selectedCell 改為 selectedCells 陣列
+            const [selectedCells, setSelectedCells] = useState([]);
+            const [searchQuery, setSearchQuery] = useState("");
+            const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+            
+            // 繪圖設定
+            const [zoom, setZoom] = useState(1.0);
+            const [pan, setPan] = useState({ x: 0, y: 0 });
+            const [isDragging, setIsDragging] = useState(false);
+            const [lastMousePos, setLastMousePos] = useState({ x: 0, y: 0 });
+            
+            // 圖層控制
+            const [visibleLayers, setVisibleLayers] = useState(new Set());
+            const [routingLayers, setRoutingLayers] = useState([]);
+            const [mastersliceLayers, setMastersliceLayers] = useState([]);
+            const [showPins, setShowPins] = useState(true);
+            const [showObs, setShowObs] = useState(true);
+
+            const canvasRef = useRef(null);
+            const containerRef = useRef(null);
+
+            useEffect(() => {
+                if (darkMode) document.documentElement.classList.add('dark');
+                else document.documentElement.classList.remove('dark');
+            }, [darkMode]);
+
+            const handleJsonUpload = (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = (event) => {
+                    try {
+                        const json = JSON.parse(event.target.result);
+                        if (json.macros) {
+                            setMacros(json.macros);
+                            setDbMicrons(json.database_microns || 1000);
+                            setSelectedCells([]); // Reset selection
+                            setZoom(1.0);
+                            setPan({ x: 0, y: 0 });
+                        } else {
+                            alert("JSON 格式錯誤: 缺少 macros");
+                        }
+                    } catch (err) { alert("讀取錯誤: " + err.message); }
+                };
+                reader.readAsText(file);
+            };
+
+            const filteredMacros = useMemo(() => {
+                return macros.filter(m => m.name.toLowerCase().includes(searchQuery.toLowerCase()));
+            }, [macros, searchQuery]);
+
+            // [修改] 選擇切換邏輯
+            const toggleCellSelection = (macro) => {
+                setSelectedCells(prev => {
+                    const exists = prev.find(c => c.name === macro.name);
+                    if (exists) {
+                        return prev.filter(c => c.name !== macro.name);
+                    } else {
+                        // 如果是第一個選取的，重置視圖
+                        if (prev.length === 0) {
+                            setZoom(1.0);
+                            setPan({ x: 0, y: 0 });
+                        }
+                        return [...prev, macro];
+                    }
+                });
+            };
+
+            // 分析用到的 Layers
+            useEffect(() => {
+                if (selectedCells.length === 0) return;
+                
+                const layers = new Set();
+                selectedCells.forEach(cell => {
+                    cell.pins.forEach(p => p.rects.forEach(r => layers.add(r.layer)));
+                    if (cell.obs) {
+                        cell.obs.forEach(o => layers.add(o.layer));
+                    }
+                });
+
+                const sortedLayers = Array.from(layers).sort((a, b) => {
+                    const getRank = (name) => {
+                        if(name === 'OBS') return 999;
+                        if(name.startsWith('VIA') || name.startsWith('V')) return 200 + parseInt(name.replace(/\D/g,'')||0);
+                        return 100 + parseInt(name.replace(/\D/g,'')||0);
+                    };
+                    return getRank(a) - getRank(b);
+                });
+
+                const routing = [];
+                const masterslice = [];
+                sortedLayers.forEach(layer => {
+                    const upper = layer.toUpperCase();
+                    const isRouting = /^(METAL|M|VIA|V)\d+$/i.test(upper);
+                    if (isRouting) routing.push(layer);
+                    else masterslice.push(layer);
+                });
+
+                setRoutingLayers(routing);
+                setMastersliceLayers(masterslice);
+                // 如果是第一次載入或清空後重新選擇，預設顯示 routing
+                if (visibleLayers.size === 0) {
+                    setVisibleLayers(new Set(routing));
+                }
+
+            }, [selectedCells]);
+
+            // --- CANVAS DRAWING ---
+            
+            const getDisplayValue = useCallback((val) => {
+                if (!val) return "0.000";
+                if (val > 100 && dbMicrons > 1) return (val / dbMicrons).toFixed(3);
+                return val.toFixed(3);
+            }, [dbMicrons]);
+
+            const getScaleFactor = useCallback((val) => {
+                if (val > 100 && dbMicrons > 1) return 1.0 / dbMicrons;
+                return 1.0;
+            }, [dbMicrons]);
+
+            const createPattern = (ctx, color, type) => {
+                const pCanvas = document.createElement('canvas');
+                pCanvas.width = 8; pCanvas.height = 8;
+                const pCtx = pCanvas.getContext('2d');
+                pCtx.strokeStyle = color;
+                pCtx.lineWidth = 1;
+                if (type === 'fwd_slash') { pCtx.beginPath(); pCtx.moveTo(0,8); pCtx.lineTo(8,0); pCtx.stroke(); } 
+                else if (type === 'back_slash') { pCtx.beginPath(); pCtx.moveTo(0,0); pCtx.lineTo(8,8); pCtx.stroke(); } 
+                else if (type === 'cross') { pCtx.beginPath(); pCtx.moveTo(4,0); pCtx.lineTo(4,8); pCtx.moveTo(0,4); pCtx.lineTo(8,4); pCtx.stroke(); } 
+                else if (type === 'dots') { pCtx.fillStyle = color; pCtx.fillRect(2,2,2,2); pCtx.fillRect(6,6,2,2); }
+                return ctx.createPattern(pCanvas, 'repeat');
+            };
+
+            const getLayerColorAndPattern = (ctx, layerName, isObsBlock) => {
+                const name = layerName.toUpperCase();
+                let color = '#FF00FF'; 
+                let patternType = 'fwd_slash';
+
+                if (LAYER_COLORS[name]) color = LAYER_COLORS[name];
+                else if (name.includes('METAL') || name.startsWith('M')) {
+                    const num = parseInt(name.replace(/\D/g, ''));
+                    if (!isNaN(num)) color = LAYER_COLORS[`METAL${num}`] || color;
+                    patternType = (num % 2 === 0) ? 'fwd_slash' : 'back_slash';
+                }
+                else if (name.includes('VIA') || name.startsWith('V')) {
+                    const num = parseInt(name.replace(/\D/g, ''));
+                    if (!isNaN(num)) color = LAYER_COLORS[`VIA${num}`] || '#FFFF00';
+                    patternType = 'dots';
+                }
+                
+                if (isObsBlock) {
+                    patternType = 'cross'; 
+                }
+
+                return { color, pattern: createPattern(ctx, color, patternType) };
+            };
+
+            const draw = useCallback(() => {
+                const canvas = canvasRef.current;
+                const container = containerRef.current;
+                if (!canvas || !container || selectedCells.length === 0) return;
+
+                const ctx = canvas.getContext('2d');
+                const dpr = window.devicePixelRatio || 1;
+                const width = container.clientWidth;
+                const height = container.clientHeight;
+                canvas.width = width * dpr;
+                canvas.height = height * dpr;
+                canvas.style.width = `${width}px`;
+                canvas.style.height = `${height}px`;
+                ctx.scale(dpr, dpr);
+                ctx.clearRect(0, 0, width, height);
+
+                // [修改] 計算多個 Cell 的總邊界
+                // 我們將 Cell 橫向排列，每個 Cell 之間留一點間距
+                const cellSpacing = 0.02; // 間距 (relative units, will be scaled)
+                let totalWidth = 0;
+                let maxHeight = 0;
+                
+                // 預先計算每個 Cell 的偏移量
+                const cellOffsets = selectedCells.map(cell => {
+                    const w = cell.size.width <= 0 ? 1.0 : cell.size.width;
+                    const h = cell.size.height <= 0 ? 1.0 : cell.size.height;
+                    const offset = totalWidth;
+                    totalWidth += w + cellSpacing;
+                    maxHeight = Math.max(maxHeight, h);
+                    return { ...cell, offset, w, h };
+                });
+                
+                // 去掉最後一個多餘的 spacing
+                if (cellOffsets.length > 0) totalWidth -= cellSpacing;
+                if (totalWidth <= 0) totalWidth = 1.0;
+
+                // 基礎適配 Scale
+                const padding = 60;
+                const availW = width - padding * 2;
+                const availH = height - padding * 2;
+                let baseScale = Math.min(availW / totalWidth, availH / maxHeight);
+                if (!isFinite(baseScale) || baseScale <= 0) baseScale = 1.0;
+                const finalScale = baseScale * zoom;
+
+                const centerX = width / 2 + pan.x;
+                const centerY = height / 2 + pan.y;
+                
+                // 全局原點 (最左側 Cell 的左下角)
+                const globalOriginX = centerX - (totalWidth * finalScale) / 2;
+                const globalOriginY = centerY + (maxHeight * finalScale) / 2;
+
+                // 繪圖函式
+                const drawCellGeometry = (cellData) => {
+                    // 每個 Cell 的局部原點
+                    const cellOriginX = globalOriginX + cellData.offset * finalScale;
+                    
+                    // 座標轉換
+                    const toCanvasX = (x) => cellOriginX + x * finalScale;
+                    const toCanvasY = (y) => globalOriginY - y * finalScale; // Y 向上
+                    const scaleLen = (l) => l * finalScale;
+
+                    // 1. 邊界
+                    ctx.strokeStyle = darkMode ? '#ffffff' : '#000000';
+                    ctx.lineWidth = 2;
+                    ctx.setLineDash([5, 5]);
+                    ctx.strokeRect(toCanvasX(0), toCanvasY(cellData.h), scaleLen(cellData.w), scaleLen(cellData.h));
+                    ctx.setLineDash([]);
+
+                    // 繪製矩形
+                    const drawRect = (rect, styleObj, isObs = false) => {
+                        const x = toCanvasX(rect.llx);
+                        const y = toCanvasY(rect.ury);
+                        const w = scaleLen(rect.urx - rect.llx);
+                        const h = scaleLen(rect.ury - rect.lly);
+                        ctx.save();
+                        ctx.globalAlpha = isObs ? 0.3 : 0.2;
+                        ctx.fillStyle = styleObj.color;
+                        ctx.fillRect(x, y, w, h);
+                        ctx.restore();
+                        ctx.save();
+                        ctx.globalAlpha = 0.8;
+                        ctx.fillStyle = styleObj.pattern;
+                        ctx.fillRect(x, y, w, h);
+                        ctx.restore();
+                        ctx.strokeStyle = styleObj.color;
+                        ctx.lineWidth = isObs ? 0.5 : 1;
+                        ctx.strokeRect(x, y, w, h);
+                    };
+
+                    // 2. OBS
+                    if (showObs && cellData.obs) {
+                        cellData.obs.forEach(obsLayer => {
+                            if (!visibleLayers.has(obsLayer.layer)) return;
+                            const layerStyle = getLayerColorAndPattern(ctx, obsLayer.layer);
+                            const obsStyle = { color: layerStyle.color, pattern: createPattern(ctx, layerStyle.color, 'cross') };
+                            obsLayer.rects.forEach(rect => drawRect(rect, obsStyle, true));
+                        });
+                    }
+
+                    // 3. Pins & Text
+                    if (showPins) {
+                        cellData.pins.forEach(pin => {
+                            pin.rects.forEach(rect => {
+                                if (!visibleLayers.has(rect.layer)) return;
+                                const style = getLayerColorAndPattern(ctx, rect.layer);
+                                drawRect(rect, style);
+                            });
+                        });
+
+                        // Text
+                        ctx.textAlign = 'center';
+                        ctx.textBaseline = 'middle';
+                        const fontSize = Math.max(10, 14 * zoom);
+                        ctx.font = `bold ${fontSize}px sans-serif`;
+
+                        cellData.pins.forEach(pin => {
+                            if (pin.rects.length === 0) return;
+                            const visibleRects = pin.rects.filter(r => visibleLayers.has(r.layer));
+                            if (visibleRects.length === 0) return;
+                            visibleRects.forEach(rect => {
+                                const cx = toCanvasX((rect.llx + rect.urx) / 2);
+                                const cy = toCanvasY((rect.lly + rect.ury) / 2);
+                                if (cx < -50 || cx > width + 50 || cy < -50 || cy > height + 50) return;
+                                const color = PIN_COLORS[pin.direction] || '#ffffff';
+                                ctx.fillStyle = color;
+                                ctx.strokeStyle = darkMode ? '#000' : '#fff';
+                                ctx.lineWidth = 3;
+                                ctx.strokeText(pin.name, cx, cy);
+                                ctx.fillText(pin.name, cx, cy);
+                            });
+                        });
+                    }
+                    
+                    // Cell Name Label
+                    ctx.textAlign = 'left';
+                    ctx.textBaseline = 'bottom';
+                    ctx.fillStyle = darkMode ? '#ffffff' : '#000000';
+                    ctx.font = `bold ${Math.max(12, 16 * zoom)}px sans-serif`;
+                    ctx.strokeStyle = darkMode ? '#000' : '#fff';
+                    ctx.lineWidth = 3;
+                    const nameX = toCanvasX(cellData.w * 0.02);
+                    const nameY = toCanvasY(cellData.h * 0.02);
+                    ctx.strokeText(cellData.name, nameX, nameY);
+                    ctx.fillText(cellData.name, nameX, nameY);
+                };
+
+                // 迴圈繪製所有選取的 Cell
+                cellOffsets.forEach(cell => drawCellGeometry(cell));
+
+                // --- 6. 繪製全域標尺 (Rulers) ---
+                // 標尺基於最左側原點
+                const rulerText = darkMode ? '#94a3b8' : '#475569';
+                ctx.font = '10px monospace';
+                ctx.fillStyle = rulerText;
+                ctx.strokeStyle = rulerText;
+                ctx.lineWidth = 1;
+
+                // 格線計算
+                const scaleValForRuler = getScaleFactor(Math.max(totalWidth, maxHeight));
+                const targetPixelSpacing = 80;
+                let lefSpacing = targetPixelSpacing / finalScale;
+                if (!isFinite(lefSpacing) || lefSpacing <= 0) lefSpacing = 1.0;
+                const exponent = Math.floor(Math.log10(lefSpacing));
+                const gridStepLEF = Math.pow(10, exponent); 
+                let actualGridStep = gridStepLEF;
+                if (lefSpacing / gridStepLEF > 5) actualGridStep *= 5;
+                else if (lefSpacing / gridStepLEF > 2) actualGridStep *= 2;
+                if (actualGridStep <= 0.000001) actualGridStep = 1.0;
+
+                // 轉換函式 (Global)
+                const toGlobalCanvasX = (x) => globalOriginX + x * finalScale;
+                const toGlobalCanvasY = (y) => globalOriginY - y * finalScale;
+                const toGlobalLefX = (cx) => (cx - globalOriginX) / finalScale;
+                const toGlobalLefY = (cy) => (globalOriginY - cy) / finalScale;
+
+                const startLefX = Math.floor(toGlobalLefX(0) / actualGridStep) * actualGridStep;
+                const endLefX = Math.ceil(toGlobalLefX(width) / actualGridStep) * actualGridStep;
+                const startLefY = Math.floor(toGlobalLefY(height) / actualGridStep) * actualGridStep;
+                const endLefY = Math.ceil(toGlobalLefY(0) / actualGridStep) * actualGridStep;
+
+                // 畫格線
+                ctx.strokeStyle = darkMode ? '#334155' : '#e2e8f0'; 
+                ctx.globalAlpha = 0.5;
+                ctx.beginPath();
+                let loopCount = 0;
+                for (let x = startLefX; x <= endLefX; x += actualGridStep) {
+                    if (loopCount++ > 2000) break; 
+                    const cx = toGlobalCanvasX(x);
+                    ctx.moveTo(cx, 0); ctx.lineTo(cx, height);
+                }
+                loopCount = 0;
+                for (let y = startLefY; y <= endLefY; y += actualGridStep) {
+                    if (loopCount++ > 2000) break;
+                    const cy = toGlobalCanvasY(y);
+                    ctx.moveTo(0, cy); ctx.lineTo(width, cy);
+                }
+                ctx.stroke();
+                ctx.globalAlpha = 1.0;
+
+                // 畫座標軸線
+                ctx.strokeStyle = darkMode ? '#94a3b8' : '#64748b';
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                const zeroX = toGlobalCanvasX(0);
+                const zeroY = toGlobalCanvasY(0);
+                if (zeroX >= -100 && zeroX <= width + 100) { ctx.moveTo(zeroX, 0); ctx.lineTo(zeroX, height); }
+                if (zeroY >= -100 && zeroY <= height + 100) { ctx.moveTo(0, zeroY); ctx.lineTo(width, zeroY); }
+                ctx.stroke();
+
+                // 標尺數值
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'top';
+                loopCount = 0;
+                for (let x = startLefX; x <= endLefX; x += actualGridStep) {
+                    if (loopCount++ > 100) break;
+                    const cx = toGlobalCanvasX(x);
+                    ctx.beginPath(); ctx.moveTo(cx, height); ctx.lineTo(cx, height - 5); ctx.stroke();
+                    const valUm = (x * scaleValForRuler).toFixed(2).replace(/\.00$/, '');
+                    ctx.fillText(valUm, cx, height - 18);
+                }
+                ctx.textAlign = 'left';
+                ctx.textBaseline = 'middle';
+                loopCount = 0;
+                for (let y = startLefY; y <= endLefY; y += actualGridStep) {
+                    if (loopCount++ > 100) break;
+                    const cy = toGlobalCanvasY(y);
+                    ctx.beginPath(); ctx.moveTo(0, cy); ctx.lineTo(5, cy); ctx.stroke();
+                    const valUm = (y * scaleValForRuler).toFixed(2).replace(/\.00$/, '');
+                    ctx.fillText(valUm, 8, cy);
+                }
+                ctx.fillStyle = darkMode ? '#fff' : '#000';
+                ctx.font = 'bold 12px sans-serif';
+                ctx.textAlign = 'right';
+                ctx.fillText("μm", width - 5, height - 5);
+
+            }, [selectedCells, zoom, pan, visibleLayers, showPins, showObs, darkMode, dbMicrons, getDisplayValue, getScaleFactor]);
+
+            useEffect(() => {
+                requestAnimationFrame(draw);
+            }, [draw]);
+
+            const handleMouseDown = (e) => {
+                setIsDragging(true);
+                setLastMousePos({ x: e.clientX, y: e.clientY });
+            };
+            const handleMouseMove = (e) => {
+                if (!isDragging) return;
+                const dx = e.clientX - lastMousePos.x;
+                const dy = e.clientY - lastMousePos.y;
+                setPan(p => ({ x: p.x + dx, y: p.y + dy }));
+                setLastMousePos({ x: e.clientX, y: e.clientY });
+            };
+            const handleMouseUp = () => setIsDragging(false);
+            const handleWheel = (e) => {
+                const delta = e.deltaY > 0 ? 0.9 : 1.1;
+                setZoom(z => Math.min(Math.max(z * delta, 0.1), 10));
+            };
+
+            const toggleLayerGroup = (layers, enable) => {
+                const next = new Set(visibleLayers);
+                layers.forEach(l => {
+                    if (enable) next.add(l);
+                    else next.delete(l);
+                });
+                setVisibleLayers(next);
+            };
+
+            const toggleLayer = (layer) => {
+                const next = new Set(visibleLayers);
+                if (next.has(layer)) next.delete(layer);
+                else next.add(layer);
+                setVisibleLayers(next);
+            };
+
+            const isSelected = (name) => selectedCells.some(c => c.name === name);
+
+            return (
+                <div className={`flex h-screen overflow-hidden ${darkMode ? 'light' : ''}`}>
+                    <div className={`${isSidebarOpen ? 'w-72' : 'w-0'} flex-shrink-0 transition-all duration-300 bg-white dark:bg-slate-850 border-r border-gray-200 dark:border-slate-700 flex flex-col`}>
+                        <div className="p-4 border-b border-gray-200 dark:border-slate-700">
+                            <h1 className="text-xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-blue-500 to-teal-400 mb-4">
+                                LEF 儀表板
+                            </h1>
+                            <div className="flex justify-between items-center mb-4">
+                                <span className="text-xs text-gray-500">已選取: {selectedCells.length}</span>
+                                {selectedCells.length > 0 && <button onClick={() => { setSelectedCells([]); setZoom(1.0); setPan({x:0, y:0}); }} className="text-xs text-red-500 hover:underline">清除全選</button>}
+                            </div>
+                            <input type="file" accept=".json" onChange={handleJsonUpload} className="block w-full text-xs mb-4 text-gray-500 file:mr-2 file:py-1 file:px-2 file:rounded-full file:border-0 file:text-xs file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 dark:file:bg-slate-700 dark:file:text-blue-400"/>
+                            <div className="relative">
+                                <span className="absolute inset-y-0 left-0 flex items-center pl-2 text-gray-400"><Icon name="search" size={14} /></span>
+                                <input type="text" placeholder="搜尋 Cell..." value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} className="w-full bg-gray-100 dark:bg-slate-900 border-none rounded-md py-2 pl-8 pr-4 text-sm focus:ring-2 focus:ring-blue-500 dark:text-white" />
+                            </div>
+                        </div>
+                        <div className="flex-1 overflow-y-auto p-2 space-y-1">
+                            {filteredMacros.map((macro) => {
+                                const active = isSelected(macro.name);
+                                return (
+                                    <button key={macro.name} onClick={() => toggleCellSelection(macro)} 
+                                        className={`w-full text-left px-3 py-2 rounded-md text-sm flex justify-between items-center transition-colors 
+                                        ${active ? 'bg-blue-600 text-white shadow-sm' : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-slate-700'}`}>
+                                        <span className="truncate">{macro.name}</span>
+                                        <span className={`text-xs opacity-70 ${active ? 'text-blue-200' : ''}`}>{macro.pins.length}P</span>
+                                    </button>
+                                );
+                            })}
+                        </div>
+                    </div>
+
+                    <div className="flex-1 flex flex-col min-w-0 bg-white dark:bg-slate-900 relative">
+                        <div className="h-12 border-b border-gray-200 dark:border-slate-700 flex items-center justify-between px-4 bg-white dark:bg-slate-900 z-10 shadow-sm">
+                            <div className="flex items-center gap-3">
+                                <button onClick={() => setIsSidebarOpen(!isSidebarOpen)} className="p-1.5 rounded hover:bg-gray-100 dark:hover:bg-slate-800 text-gray-600 dark:text-gray-300"><Icon name={isSidebarOpen ? "panel-left-close" : "panel-left-open"} /></button>
+                                <h2 className="font-semibold dark:text-white">
+                                    {selectedCells.length > 0 ? `已選取 ${selectedCells.length} 個 Cells` : '請選擇 Cell'}
+                                </h2>
+                            </div>
+                            <button onClick={() => setDarkMode(!darkMode)} className="p-1.5 rounded hover:bg-gray-100 dark:hover:bg-slate-800">{darkMode ? <Icon name="sun" className="text-yellow-400" /> : <Icon name="moon" className="text-gray-600" />}</button>
+                        </div>
+
+                        {selectedCells.length > 0 ? (
+                            <div className="flex-1 flex flex-col lg:flex-row overflow-hidden">
+                                <div ref={containerRef} className="flex-1 relative bg-gray-50 dark:bg-slate-900 canvas-container overflow-hidden"
+                                     onMouseDown={handleMouseDown} onMouseMove={handleMouseMove} onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp} onWheel={handleWheel}>
+                                    <div className="absolute top-4 right-4 z-20 flex flex-col gap-1 bg-white dark:bg-slate-800 p-1 rounded shadow border border-gray-200 dark:border-slate-600">
+                                        <button onClick={() => setZoom(z => z * 1.2)} className="p-1 hover:bg-gray-100 dark:hover:bg-slate-700"><Icon name="zoom-in" size={16}/></button>
+                                        <button onClick={() => setZoom(z => z / 1.2)} className="p-1 hover:bg-gray-100 dark:hover:bg-slate-700"><Icon name="zoom-out" size={16}/></button>
+                                        <button onClick={() => { setZoom(1.0); setPan({x:0, y:0}); }} className="p-1 hover:bg-gray-100 dark:hover:bg-slate-700"><Icon name="maximize" size={16}/></button>
+                                    </div>
+                                    <canvas ref={canvasRef} className="block w-full h-full" />
+                                </div>
+
+                                <div className="w-full lg:w-72 border-t lg:border-t-0 lg:border-l border-gray-200 dark:border-slate-700 bg-white dark:bg-slate-850 p-4 overflow-y-auto flex flex-col gap-6">
+                                    <div className="space-y-6">
+                                        <div>
+                                            <div className="flex justify-between items-center mb-2">
+                                                <h3 className="text-sm font-bold uppercase text-gray-500 dark:text-gray-400">圖層控制</h3>
+                                            </div>
+                                            
+                                            <div className="mb-4 border-b border-gray-100 dark:border-slate-700 pb-4">
+                                                <h4 className="text-xs font-bold text-gray-400 mb-2 pl-1">Cell</h4>
+                                                <div className="flex gap-4 pl-1">
+                                                    <label className="flex items-center gap-2 cursor-pointer"><input type="checkbox" checked={showPins} onChange={(e) => setShowPins(e.target.checked)} className="rounded text-blue-500"/><span className="text-xs font-medium dark:text-gray-300">PIN</span></label>
+                                                    <label className="flex items-center gap-2 cursor-pointer"><input type="checkbox" checked={showObs} onChange={(e) => setShowObs(e.target.checked)} className="rounded text-blue-500"/><span className="text-xs font-medium dark:text-gray-300">OBS</span></label>
+                                                </div>
+                                            </div>
+
+                                            {routingLayers.length > 0 && (
+                                                <div className="mb-4 border-b border-gray-100 dark:border-slate-700 pb-4">
+                                                    <div className="flex justify-between items-center mb-2 pl-1">
+                                                        <h4 className="text-xs font-bold text-gray-400">Routing</h4>
+                                                        <div className="flex gap-2 text-xs"><button onClick={() => toggleLayerGroup(routingLayers, true)} className="text-blue-500 hover:underline">全選</button><button onClick={() => toggleLayerGroup(routingLayers, false)} className="text-blue-500 hover:underline">全取消</button></div>
+                                                    </div>
+                                                    <div className="space-y-1 bg-gray-50 dark:bg-slate-900 p-2 rounded border border-gray-100 dark:border-slate-700 max-h-48 overflow-y-auto">
+                                                        {routingLayers.map(layer => (
+                                                            <label key={layer} className="flex items-center gap-2 cursor-pointer hover:bg-gray-100 dark:hover:bg-slate-800 p-1 rounded">
+                                                                <input type="checkbox" checked={visibleLayers.has(layer)} onChange={() => toggleLayer(layer)} className="rounded text-blue-500"/>
+                                                                <span className="w-3 h-3 rounded-full border border-gray-300 dark:border-gray-600" style={{ backgroundColor: LAYER_COLORS[layer] || '#FF00FF' }}></span>
+                                                                <span className="text-xs font-mono font-medium dark:text-gray-300">{layer}</span>
+                                                            </label>
+                                                        ))}
+                                                    </div>
+                                                </div>
+                                            )}
+                                            
+                                            {mastersliceLayers.length > 0 && (
+                                                <div>
+                                                    <div className="flex justify-between items-center mb-2 pl-1">
+                                                        <h4 className="text-xs font-bold text-gray-400">Masterslice</h4>
+                                                        <div className="flex gap-2 text-xs"><button onClick={() => toggleLayerGroup(mastersliceLayers, true)} className="text-blue-500 hover:underline">全選</button><button onClick={() => toggleLayerGroup(mastersliceLayers, false)} className="text-blue-500 hover:underline">全取消</button></div>
+                                                    </div>
+                                                    <div className="space-y-1 bg-gray-50 dark:bg-slate-900 p-2 rounded border border-gray-100 dark:border-slate-700 max-h-32 overflow-y-auto">
+                                                        {mastersliceLayers.map(layer => (
+                                                            <label key={layer} className="flex items-center gap-2 cursor-pointer hover:bg-gray-100 dark:hover:bg-slate-800 p-1 rounded">
+                                                                <input type="checkbox" checked={visibleLayers.has(layer)} onChange={() => toggleLayer(layer)} className="rounded text-blue-500"/>
+                                                                <span className="w-3 h-3 rounded-full border border-gray-300 dark:border-gray-600" style={{ backgroundColor: LAYER_COLORS[layer] || '#FF00FF' }}></span>
+                                                                <span className="text-xs font-mono font-medium dark:text-gray-300">{layer}</span>
+                                                            </label>
+                                                        ))}
+                                                    </div>
+                                                </div>
+                                            )}
+                                        </div>
+                                        
+                                        <div>
+                                            <h3 className="text-sm font-bold uppercase text-gray-500 dark:text-gray-400 mb-2">Cell 資訊列表</h3>
+                                            <div className="space-y-2">
+                                                {selectedCells.map(cell => (
+                                                    <div key={cell.name} className="bg-gray-50 dark:bg-slate-900 rounded p-3 text-sm space-y-1 border border-gray-100 dark:border-slate-700">
+                                                        <div className="font-bold text-blue-600 dark:text-blue-400 mb-1">{cell.name}</div>
+                                                        <div className="flex justify-between"><span className="text-gray-500">尺寸 (μm)</span><span className="font-mono dark:text-gray-200">{getDisplayValue(cell.size.width)} x {getDisplayValue(cell.size.height)}</span></div>
+                                                        <div className="flex justify-between"><span className="text-gray-500">Pins</span><span className="font-mono dark:text-gray-200">{cell.pins.length}</span></div>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        ) : (
+                            <div className="flex-1 flex flex-col items-center justify-center text-gray-400">
+                                <Icon name="layout" size={48} className="mb-2 opacity-20" />
+                                <p>請選擇一個或多個 Cell</p>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
